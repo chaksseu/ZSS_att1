@@ -17,4 +17,7 @@ wget -c -O dataset.tar "https://zenodo.org/records/14342967/files/dataset.tar?do
 wget -c -O checkpoints.tar "https://zenodo.org/records/14342967/files/checkpoints.tar?download=1" && tar -xf checkpoints.tar
 cd checkpoints/; wget -c "https://zenodo.org/records/7884686/files/audioldm-s-full" && mv "audioldm-s-full" "audioldm-s-full.ckpt"
 cd ../../
+
+# run pkboo.py
+python audioldm_train/train/pkboo.py
 ```
