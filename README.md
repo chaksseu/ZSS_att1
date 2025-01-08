@@ -1,4 +1,4 @@
-'''
+```
 # Create conda environment
 conda create -n 3.10.12 python=3.10.12
 conda activate 3.10.12
@@ -17,4 +17,4 @@ wget -c -O dataset.tar "https://zenodo.org/records/14342967/files/dataset.tar?do
 wget -c -O checkpoints.tar "https://zenodo.org/records/14342967/files/checkpoints.tar?download=1" && tar -xf checkpoints.tar
 cd checkpoints/; wget -c "https://zenodo.org/records/7884686/files/audioldm-s-full" && mv "audioldm-s-full" "audioldm-s-full.ckpt"
 cd ../../
-'''
+```
