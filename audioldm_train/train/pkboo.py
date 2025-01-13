@@ -76,25 +76,38 @@ class AudioPeekabooSeparator(nn.Module):
 
         return (self.data, alpha) if return_alpha else self.data
     
-def get_mixed_audio(batch1, batch2, snr_db=0):
-    wav1 = batch1["waveform"]  # [B=1, 1, samples_num]
-    wav2 = batch2["waveform"]
+def get_mixed_batches(batch1, batch2, dataset, snr_db=0, device=None):
+    wav1, wav2 = batch1["waveform"], batch2["waveform"]  # [B=1, 1, samples_num]
     assert wav1.shape == wav2.shape, "두 WAV 텐서의 shape이 같아야 합니다"
-    # 각 신호의 파워 계산
-    power1 = torch.mean(wav1 ** 2)
-    power2 = torch.mean(wav2 ** 2)
-    # SNR에 따른 스케일링 계수 계산
-    scaling_factor = torch.sqrt(power1 / power2 * 10 ** (-snr_db/10))
-    # wav2를 스케일링하여 원하는 SNR 달성
-    wav2_scaled = wav2 * scaling_factor
-    # 두 신호 믹스
-    mixed = wav1 + wav2_scaled
-    # 클리핑 방지를 위한 정규화 (선택사항)
-    max_abs = torch.max(torch.abs(mixed))
+    power1, power2 = torch.mean(wav1 ** 2), torch.mean(wav2 ** 2)  # 각 신호의 파워 계산
+    scaling_factor = torch.sqrt(power1 / power2 * 10 ** (-snr_db/10))  # SNR에 따른 스케일링 계수 계산
+    mixed = wav1 + wav2 * scaling_factor  # 두 신호 믹스
+    max_abs = mixed.abs().max()
     if max_abs > 1:
-        mixed = mixed / max_abs
-    
-    return mixed
+        mixed /= max_abs  # 클리핑 방지를 위한 정규화 (선택사항)
+    mixed_wav = (mixed * 0.5).float()
+    log_mel_spec, stft = dataset.mel_spectrogram_train(mixed_wav[0, ...])
+    log_mel_spec = dataset.pad_spec(torch.FloatTensor(log_mel_spec.T)).unsqueeze(0).float()
+    stft = dataset.pad_spec(torch.FloatTensor(stft.T)).unsqueeze(0).float()
+    if device:
+        mixed_wav, log_mel_spec, stft = mixed_wav.to(device), log_mel_spec.to(device), stft.to(device)
+    def set_dict(batch):
+        label_vector = batch["label_vector"].float()
+        if device:
+            label_vector = label_vector.to(device)
+        return {
+            "text": batch["text"],
+            "fname": batch["fname"],
+            "label_vector": label_vector,
+            "waveform": mixed_wav,
+            "stft": stft,
+            "log_mel_spec": log_mel_spec,
+            "duration": batch["duration"],
+            "sampling_rate": batch["sampling_rate"],
+            "random_start_sample_in_original_audio_file":
+                batch["random_start_sample_in_original_audio_file"],
+        }
+    return set_dict(batch1), set_dict(batch2)
 
 def setting_result_folder(fname: str):
     '''
@@ -289,20 +302,8 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
             if key not in state_dict.keys() or state_dict[key].size() != ckpt[key].size():
                 del ckpt[key]
         latent_diffusion.load_state_dict(ckpt, strict=False)
-    
-    '''        
-    data = {
-        "text":          text,                        # list
-        "fname":         self.text_to_filename(text)  # list
-        "label_vector":  label_vector.float(),        # tensor, [B, class_num]
-        "waveform":      waveform.float(),            # tensor, [B, 1, samples_num] = [1, 1, 163840] (=10.24*16000)
-        "stft":          stft.float(),                # tensor, [B, t-steps, f-bins]
-        "log_mel_spec":  log_mel_spec.float(),        # tensor, [B, t-steps, mel-bins] = [1, 1024, 64]
-        "duration":      self.duration,
-        "sampling_rate": self.sampling_rate,
-        "random_start_sample_in_original_audio_file": random_start,}
-    '''
 
+    ##### 여기까지는 latent_diffusion 모델을 불러오는 과정 #####
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # latent diffusion 파라미터 freezing
@@ -317,38 +318,7 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
         __ = next(iter(loader))
     batch2 = next(iter(loader))
 
-    assert batch1['log_mel_spec'].shape[0] == 1 and batch2['log_mel_spec'].shape[0] == 1, 'batch should be one data'
-
-    mixed_wav = get_mixed_audio(batch1, batch2, snr_db=0)  # [1, 1, 163840]
-    log_mel_spec, stft = dataset.mel_spectrogram_train(mixed_wav[0, ...])  # log_mel_spec: [64, 1024], stft: [513, 1024], mixed_wav[0, ...]: [1, 163840]
-    log_mel_spec = torch.FloatTensor(log_mel_spec.T)  # log_mel_spec: [1024, 64]
-    stft = torch.FloatTensor(stft.T)  # stft: [1024, 513]
-    log_mel_spec, stft = dataset.pad_spec(log_mel_spec), dataset.pad_spec(stft)  # log_mel_spec: [1024, 64]), stft: [1024, 512]
-    log_mel_spec, stft = log_mel_spec.unsqueeze(0), stft.unsqueeze(0)            # log_mel_spec: [1, 1024, 64], stft: [1, 1024, 512]
-    
-    batch_to_sep1 = {
-        "text": batch1['text'],
-        "fname": batch1['fname'],
-        "label_vector": batch1['label_vector'].to(device),
-        "waveform": mixed_wav.float().to(device),
-        "stft": stft.float().to(device),
-        "log_mel_spec": log_mel_spec.float().to(device),
-        "duration": batch1['duration'],
-        "sampling_rate": batch1['sampling_rate'],
-        "random_start_sample_in_original_audio_file": batch1['random_start_sample_in_original_audio_file'],
-    }
-
-    batch_to_sep2 = {
-        "text": batch2['text'],
-        "fname": batch2['fname'],
-        "label_vector": batch2['label_vector'].to(device),
-        "waveform": mixed_wav.float().to(device),
-        "stft": stft.float().to(device),
-        "log_mel_spec": log_mel_spec.float().to(device),  # [1, 1024, 64]
-        "duration": batch2['duration'],
-        "sampling_rate": batch2['sampling_rate'],
-        "random_start_sample_in_original_audio_file": batch2['random_start_sample_in_original_audio_file'],
-    }
+    sep_data1, sep_data2 = get_mixed_batches(batch1, batch2, dataset, snr_db=0, device=device)    
 
     # hyper parameter setting
     GRAVITY=kwargs['GRAVITY']
@@ -358,10 +328,9 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
     GUIDANCE_SCALE=kwargs['GUIDANCE_SCALE']
     REPRESENTATION=kwargs['REPRESENTATION']
 
+    fname, f_alpha, f_sep_mel = setting_result_folder(sep_data1['text'][0])
 
-    fname, f_alpha, f_sep_mel = setting_result_folder(batch_to_sep1['text'][0])
-
-    pkboo = AudioPeekabooSeparator(batch_to_sep1, latent_diffusion.device, representation=REPRESENTATION).to(device)
+    pkboo = AudioPeekabooSeparator(sep_data1, latent_diffusion.device, representation=REPRESENTATION).to(device)
     params = list(pkboo.parameters())
     for param in pkboo.parameters():
         param.requires_grad = True
@@ -373,7 +342,7 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
     NUM_PREVIEWS = 10
     preview_interval = max(1, NUM_ITER // NUM_PREVIEWS)  # 10번의 미리보기를 표시
 
-    save_initial_state(log_mel_spec, fname, latent_diffusion)
+    save_initial_state(sep_data1['log_mel_spec'], fname, latent_diffusion)
     trigger = 0
 
     try:
@@ -435,7 +404,7 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
     finally:
         kwargs['GRAVITY'] = GRAVITY
         kwargs['LEARNING_RATE'] = LEARNING_RATE
-        save_audio_metadata(batch_to_sep1, batch_to_sep2, kwargs, os.path.join(fname, "metadata.yaml"))
+        save_audio_metadata(sep_data1, sep_data2, kwargs, os.path.join(fname, "metadata.yaml"))
         torch.cuda.empty_cache()
 
     '''
