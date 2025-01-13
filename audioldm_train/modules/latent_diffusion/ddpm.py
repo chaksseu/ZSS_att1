@@ -1,57 +1,45 @@
-from multiprocessing.sharedctypes import Value
-import statistics
-import sys
+# Python standard libraries
 import os
-# from tkinter import E
-
-import torch
-import torch.nn as nn
-import numpy as np
-import pytorch_lightning as pl
-from torch.optim.lr_scheduler import LambdaLR
-from einops import rearrange, repeat
+import datetime
 from contextlib import contextmanager
 from functools import partial
+from multiprocessing.sharedctypes import Value
+
+# Third-party libraries
+import numpy as np
+import pytorch_lightning as pl
+import soundfile as sf
+import torch
+import torch.nn as nn
+from einops import rearrange, repeat
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from tqdm import tqdm
 from torchvision.utils import make_grid
-from pytorch_lightning.utilities.rank_zero import rank_zero_only
+
+# Local modules
 from audioldm_train.conditional_models import *
-import datetime
-
-from audioldm_train.utilities.model_util import (
-    exists,
-    default,
-    mean_flat,
-    count_params,
-    instantiate_from_config,
-)
-
+from audioldm_train.modules.diffusionmodules.distributions import DiagonalGaussianDistribution
+from audioldm_train.modules.diffusionmodules.ema import LitEma
+from audioldm_train.modules.latent_diffusion.ddim import DDIMSampler
+from audioldm_train.modules.latent_diffusion.plms import PLMSSampler
 from audioldm_train.utilities.diffusion_util import (
     make_beta_schedule,
     extract_into_tensor,
     noise_like,
 )
-
-from audioldm_train.modules.diffusionmodules.ema import LitEma
-from audioldm_train.modules.diffusionmodules.distributions import (
-    normal_kl,
-    DiagonalGaussianDistribution,
+from audioldm_train.utilities.model_util import (
+    exists,
+    default,
+    count_params,
+    instantiate_from_config,
 )
 
-
-from audioldm_train.modules.latent_diffusion.ddim import DDIMSampler
-from audioldm_train.modules.latent_diffusion.plms import PLMSSampler
-import soundfile as sf
-import os
-
 __conditioning_keys__ = {"concat": "c_concat", "crossattn": "c_crossattn", "adm": "y"}
-
 
 def disabled_train(self, mode=True):
     """Overwrite model.train with this function to make sure train/eval mode
     does not change anymore."""
     return self
-
 
 def uniform_on_device(r1, r2, shape, device):
     return (r1 - r2) * torch.rand(*shape, device=device) + r2
@@ -93,27 +81,25 @@ class DDPM(pl.LightningModule):
         evaluator=None,
     ):
         super().__init__()
-        assert parameterization in [
-            "eps",
-            "x0",
-            "v",
-        ], 'currently only supporting "eps" and "x0" and "v"'
+        assert parameterization in ["eps", "x0", "v"], 'currently only supporting "eps", "x0" and "v"'
         self.parameterization = parameterization
         self.state = None
-        print(
-            f"{self.__class__.__name__}: Running in {self.parameterization}-prediction mode"
-        )
+        print(f"{self.__class__.__name__}: Running in {self.parameterization}-prediction mode")
         assert sampling_rate is not None
+
+        # Basic configurations
         self.validation_folder_name = "temp_name"
         self.clip_denoised = clip_denoised
         self.log_every_t = log_every_t
         self.first_stage_key = first_stage_key
         self.sampling_rate = sampling_rate
+
+        # Initialize CLAP model
         self.clap = CLAPAudioEmbeddingClassifierFreev2(
             pretrained_path="data/checkpoints/clap_music_speech_audioset_epoch_15_esc_89.98.pt",
             sampling_rate=self.sampling_rate,
             embed_mode="audio",
-            amodel="HTSAT-base",
+            amodel="HTSAT-base"
         )
 
         if self.global_rank == 0:
@@ -121,11 +107,13 @@ class DDPM(pl.LightningModule):
 
         self.initialize_param_check_toolkit()
 
+        # Model configurations
         self.latent_t_size = latent_t_size
         self.latent_f_size = latent_f_size
-
         self.channels = channels
         self.use_positional_encodings = use_positional_encodings
+
+        # Initialize model and EMA
         self.model = DiffusionWrapper(unet_config, conditioning_key)
         count_params(self.model, verbose=True)
         self.use_ema = use_ema
@@ -133,45 +121,43 @@ class DDPM(pl.LightningModule):
             self.model_ema = LitEma(self.model)
             print(f"Keeping EMAs of {len(list(self.model_ema.buffers()))}.")
 
+        # Scheduler and loss configurations
         self.use_scheduler = scheduler_config is not None
         if self.use_scheduler:
             self.scheduler_config = scheduler_config
-
         self.v_posterior = v_posterior
         self.original_elbo_weight = original_elbo_weight
         self.l_simple_weight = l_simple_weight
+        self.loss_type = loss_type
 
+        # Checkpoint handling
         if monitor is not None:
             self.monitor = monitor
         if ckpt_path is not None:
-            self.init_from_ckpt(
-                ckpt_path, ignore_keys=ignore_keys, only_model=load_only_unet
-            )
+            self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys, only_model=load_only_unet)
 
+        # Register diffusion schedule
         self.register_schedule(
             given_betas=given_betas,
             beta_schedule=beta_schedule,
             timesteps=timesteps,
             linear_start=linear_start,
             linear_end=linear_end,
-            cosine_s=cosine_s,
+            cosine_s=cosine_s
         )
 
-        self.loss_type = loss_type
-
+        # Logvar initialization
         self.learn_logvar = learn_logvar
         self.logvar = torch.full(fill_value=logvar_init, size=(self.num_timesteps,))
-        if self.learn_logvar:
-            self.logvar = nn.Parameter(self.logvar, requires_grad=True)
-        else:
-            self.logvar = nn.Parameter(self.logvar, requires_grad=False)
+        self.logvar = nn.Parameter(self.logvar, requires_grad=learn_logvar)  # learn_logvar: True/False
 
+        # Logger configurations
         self.logger_save_dir = None
         self.logger_exp_name = None
         self.logger_exp_group_name = None
         self.logger_version = None
-
         self.label_indices_total = None
+
         # To avoid the system cannot find metric value for checkpoint
         self.metrics_buffer = {
             "val/kullback_leibler_divergence_sigmoid": 15.0,
@@ -189,9 +175,7 @@ class DDPM(pl.LightningModule):
         self.test_data_subset_path = None
 
     def get_log_dir(self):
-        return os.path.join(
-            self.logger_save_dir, self.logger_exp_group_name, self.logger_exp_name
-        )
+        return os.path.join(self.logger_save_dir, self.logger_exp_group_name, self.logger_exp_name)
 
     def set_log_dir(self, save_dir, exp_group_name, exp_name):
         self.logger_save_dir = save_dir
@@ -207,96 +191,54 @@ class DDPM(pl.LightningModule):
         linear_end=2e-2,
         cosine_s=8e-3,
     ):
-        if exists(given_betas):
-            betas = given_betas
-        else:
-            betas = make_beta_schedule(
-                beta_schedule,
-                timesteps,
-                linear_start=linear_start,
-                linear_end=linear_end,
-                cosine_s=cosine_s,
-            )
+        # Calculate betas and alphas
+        betas = given_betas if exists(given_betas) else make_beta_schedule(
+            beta_schedule, timesteps, linear_start, linear_end, cosine_s)
+        
         alphas = 1.0 - betas
         alphas_cumprod = np.cumprod(alphas, axis=0)
         alphas_cumprod_prev = np.append(1.0, alphas_cumprod[:-1])
 
-        (timesteps,) = betas.shape
-        self.num_timesteps = int(timesteps)
+        # Store basic parameters
+        self.num_timesteps = int(betas.shape[0])
         self.linear_start = linear_start
         self.linear_end = linear_end
-        assert (
-            alphas_cumprod.shape[0] == self.num_timesteps
-        ), "alphas have to be defined for each timestep"
+        assert alphas_cumprod.shape[0] == self.num_timesteps, "alphas have to be defined for each timestep"
 
+       # Convert numpy arrays to torch tensors
         to_torch = partial(torch.tensor, dtype=torch.float32)
 
+        # Register basic diffusion parameters
         self.register_buffer("betas", to_torch(betas))
         self.register_buffer("alphas_cumprod", to_torch(alphas_cumprod))
         self.register_buffer("alphas_cumprod_prev", to_torch(alphas_cumprod_prev))
 
-        # calculations for diffusion q(x_t | x_{t-1}) and others
+        # Register sqrt and log calculations for diffusion q(x_t | x_{t-1}) and others
         self.register_buffer("sqrt_alphas_cumprod", to_torch(np.sqrt(alphas_cumprod)))
-        self.register_buffer(
-            "sqrt_one_minus_alphas_cumprod", to_torch(np.sqrt(1.0 - alphas_cumprod))
-        )
-        self.register_buffer(
-            "log_one_minus_alphas_cumprod", to_torch(np.log(1.0 - alphas_cumprod))
-        )
-        self.register_buffer(
-            "sqrt_recip_alphas_cumprod", to_torch(np.sqrt(1.0 / alphas_cumprod))
-        )
-        self.register_buffer(
-            "sqrt_recipm1_alphas_cumprod", to_torch(np.sqrt(1.0 / alphas_cumprod - 1))
-        )
+        self.register_buffer("sqrt_one_minus_alphas_cumprod", to_torch(np.sqrt(1.0 - alphas_cumprod)))
+        self.register_buffer("log_one_minus_alphas_cumprod", to_torch(np.log(1.0 - alphas_cumprod)))
+        self.register_buffer("sqrt_recip_alphas_cumprod", to_torch(np.sqrt(1.0 / alphas_cumprod)))
+        self.register_buffer("sqrt_recipm1_alphas_cumprod", to_torch(np.sqrt(1.0 / alphas_cumprod - 1)))
 
-        # calculations for posterior q(x_{t-1} | x_t, x_0)
-        posterior_variance = (1 - self.v_posterior) * betas * (
-            1.0 - alphas_cumprod_prev
-        ) / (1.0 - alphas_cumprod) + self.v_posterior * betas
+        # Calculate posterior parameters q(x_{t-1} | x_t, x_0)
+        posterior_variance = (1 - self.v_posterior) * betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod) + self.v_posterior * betas
         # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
         self.register_buffer("posterior_variance", to_torch(posterior_variance))
         # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
-        self.register_buffer(
-            "posterior_log_variance_clipped",
-            to_torch(np.log(np.maximum(posterior_variance, 1e-20))),
-        )
-        self.register_buffer(
-            "posterior_mean_coef1",
-            to_torch(betas * np.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)),
-        )
-        self.register_buffer(
-            "posterior_mean_coef2",
-            to_torch(
-                (1.0 - alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - alphas_cumprod)
-            ),
-        )
+        self.register_buffer("posterior_log_variance_clipped", to_torch(np.log(np.maximum(posterior_variance, 1e-20))))
+        self.register_buffer("posterior_mean_coef1", to_torch(betas * np.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)))
+        self.register_buffer("posterior_mean_coef2", to_torch((1.0 - alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - alphas_cumprod)))
 
+        # Calculate LVLB weights based on parameterization
         if self.parameterization == "eps":
-            lvlb_weights = self.betas**2 / (
-                2
-                * self.posterior_variance
-                * to_torch(alphas)
-                * (1 - self.alphas_cumprod)
-            )
+            lvlb_weights = self.betas**2 / (2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod))
         elif self.parameterization == "x0":
-            lvlb_weights = (
-                0.5
-                * np.sqrt(torch.Tensor(alphas_cumprod))
-                / (2.0 * 1 - torch.Tensor(alphas_cumprod))
-            )
+            lvlb_weights = 0.5 * np.sqrt(torch.Tensor(alphas_cumprod)) / (2.0 * 1 - torch.Tensor(alphas_cumprod))
         elif self.parameterization == "v":
-            lvlb_weights = torch.ones_like(
-                self.betas**2
-                / (
-                    2
-                    * self.posterior_variance
-                    * to_torch(alphas)
-                    * (1 - self.alphas_cumprod)
-                )
-            )
+            lvlb_weights = torch.ones_like(self.betas**2 / (2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod)))
         else:
             raise NotImplementedError("mu not supported")
+        
         # TODO how to choose this term
         lvlb_weights[0] = lvlb_weights[1]
         self.register_buffer("lvlb_weights", lvlb_weights, persistent=False)
@@ -318,58 +260,50 @@ class DDPM(pl.LightningModule):
                     print(f"{context}: Restored training weights")
 
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
+        # Load checkpoint
         sd = torch.load(path, map_location="cpu")
         if "state_dict" in list(sd.keys()):
             sd = sd["state_dict"]
-        keys = list(sd.keys())
-        for k in keys:
+        # Remove ignored keys
+        for k in list(sd.keys()):
             for ik in ignore_keys:
                 if k.startswith(ik):
-                    print("Deleting key {} from state_dict.".format(k))
+                    print(f"Deleting key {k} from state_dict.")
                     del sd[k]
-        missing, unexpected = (
-            self.load_state_dict(sd, strict=False)
-            if not only_model
-            else self.model.load_state_dict(sd, strict=False)
-        )
-        print(
-            f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys"
-        )
-        if len(missing) > 0:
+        # Load state dict
+        target = self.model if only_model else self
+        missing, unexpected = target.load_state_dict(sd, strict=False)
+
+        # Print restoration info
+        print(f"Restored from {path}")
+        print(f"Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+        if missing:  # len(missing) > 0
             print(f"Missing Keys: {missing}")
-        if len(unexpected) > 0:
+        if unexpected:  # len(unexpected) > 0
             print(f"Unexpected Keys: {unexpected}")
 
     def q_mean_variance(self, x_start, t):
-        """
-        Get the distribution q(x_t | x_0).
-        :param x_start: the [N x C x ...] tensor of noiseless inputs.
-        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
-        :return: A tuple (mean, variance, log_variance), all of x_start's shape.
-        """
+        """  # q(x_t | x_0) distribution 계산
+        x_start: [N x C x ...] noise 없는 input tensor 
+        t: diffusion step 수 (1을 뺀 값, 0은 step-1 을 의미함)
+            tuple (mean, variance, log_variance), x_start와 동일한 shape"""
         mean = extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
         variance = extract_into_tensor(1.0 - self.alphas_cumprod, t, x_start.shape)
-        log_variance = extract_into_tensor(
-            self.log_one_minus_alphas_cumprod, t, x_start.shape
-        )
+        log_variance = extract_into_tensor(self.log_one_minus_alphas_cumprod, t, x_start.shape)
         return mean, variance, log_variance
 
     def predict_start_from_noise(self, x_t, t, noise):
-        return (
-            extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
-            - extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
-            * noise
-        )
+        sqrt_recip = extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape)
+        sqrt_recipm1 = extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+        return sqrt_recip * x_t - sqrt_recipm1 * noise
 
     def q_posterior(self, x_start, x_t, t):
-        posterior_mean = (
-            extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start
-            + extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
-        )
+        mean_coef1 = extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape)
+        mean_coef2 = extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape)
+        posterior_mean = mean_coef1 * x_start + mean_coef2 * x_t
+
         posterior_variance = extract_into_tensor(self.posterior_variance, t, x_t.shape)
-        posterior_log_variance_clipped = extract_into_tensor(
-            self.posterior_log_variance_clipped, t, x_t.shape
-        )
+        posterior_log_variance_clipped = extract_into_tensor(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def p_mean_variance(self, x, t, clip_denoised: bool):
@@ -381,45 +315,38 @@ class DDPM(pl.LightningModule):
         if clip_denoised:
             x_recon.clamp_(-1.0, 1.0)
 
-        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
-            x_start=x_recon, x_t=x, t=t
-        )
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.no_grad()
     def p_sample(self, x, t, clip_denoised=True, repeat_noise=False):
-        b, *_, device = *x.shape, x.device
-        model_mean, _, model_log_variance = self.p_mean_variance(
-            x=x, t=t, clip_denoised=clip_denoised
-        )
+        batch_size, *_, device = *x.shape, x.device
+        model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
         noise = noise_like(x.shape, device, repeat_noise)
         # no noise when t == 0
-        nonzero_mask = (
-            (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1))).contiguous()
-        )
+        nonzero_mask = (1 - (t == 0).float()).reshape(batch_size, *((1,) * (len(x.shape) - 1))).contiguous()
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.no_grad()
     def p_sample_loop(self, shape, return_intermediates=False):
         device = self.betas.device
-        b = shape[0]
+        batch_size = shape[0]
+        # 초기 노이즈 이미지 생성
         img = torch.randn(shape, device=device)
         intermediates = [img]
-        for i in tqdm(
-            reversed(range(0, self.num_timesteps)),
-            desc="Sampling t",
-            total=self.num_timesteps,
-        ):
+        # 역방향 확산 프로세스
+        for i in tqdm(reversed(range(self.num_timesteps)), desc="Sampling t", total=self.num_timesteps):
+            # 현재 timestep에 대한 sampling
             img = self.p_sample(
                 img,
-                torch.full((b,), i, device=device, dtype=torch.long),
-                clip_denoised=self.clip_denoised,
+                torch.full((batch_size,), i, device=device, dtype=torch.long),
+                clip_denoised=self.clip_denoised
             )
+            # 중간 결과 저장
             if i % self.log_every_t == 0 or i == self.num_timesteps - 1:
                 intermediates.append(img)
-        if return_intermediates:
-            return img, intermediates
-        return img
+
+        return (img, intermediates) if return_intermediates else img
 
     @torch.no_grad()
     def sample(self, batch_size=16, return_intermediates=False):
@@ -429,11 +356,9 @@ class DDPM(pl.LightningModule):
 
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
-        return (
-            extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-            + extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
-            * noise
-        )
+        sqrt_alpha = extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape)
+        sqrt_one_minus_alpha = extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+        return sqrt_alpha * x_start + sqrt_one_minus_alpha * noise
 
     def get_loss(self, pred, target, mean=True):
         if self.loss_type == "l1":
@@ -451,25 +376,19 @@ class DDPM(pl.LightningModule):
         return loss
 
     def predict_start_from_z_and_v(self, x_t, t, v):
-        # self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod)))
-        # self.register_buffer('sqrt_one_minus_alphas_cumprod', to_torch(np.sqrt(1. - alphas_cumprod)))
-        return (
-            extract_into_tensor(self.sqrt_alphas_cumprod, t, x_t.shape) * x_t
-            - extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
-        )
+        sqrt_alpha = extract_into_tensor(self.sqrt_alphas_cumprod, t, x_t.shape)
+        sqrt_one_minus_alpha = extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
+        return sqrt_alpha * x_t - sqrt_one_minus_alpha * v
 
     def predict_eps_from_z_and_v(self, x_t, t, v):
-        return (
-            extract_into_tensor(self.sqrt_alphas_cumprod, t, x_t.shape) * v
-            + extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
-            * x_t
-        )
+        sqrt_alpha = extract_into_tensor(self.sqrt_alphas_cumprod, t, x_t.shape)
+        sqrt_one_minus_alpha = extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
+        return sqrt_alpha * v + sqrt_one_minus_alpha * x_t
 
     def get_v(self, x, noise, t):
-        return (
-            extract_into_tensor(self.sqrt_alphas_cumprod, t, x.shape) * noise
-            - extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * x
-        )
+        sqrt_alpha = extract_into_tensor(self.sqrt_alphas_cumprod, t, x.shape)
+        sqrt_one_minus_alpha = extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
+        return sqrt_alpha * noise - sqrt_one_minus_alpha * x
 
     def p_losses(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -484,9 +403,7 @@ class DDPM(pl.LightningModule):
         elif self.parameterization == "v":
             target = self.get_v(x_start, noise, t)
         else:
-            raise NotImplementedError(
-                f"Paramterization {self.parameterization} not yet supported"
-            )
+            raise NotImplementedError(f"Paramterization {self.parameterization} not yet supported")
 
         loss = self.get_loss(model_out, target, mean=False).mean(dim=[1, 2, 3])
 
@@ -505,16 +422,10 @@ class DDPM(pl.LightningModule):
         return loss, loss_dict
 
     def forward(self, x, *args, **kwargs):
-        # b, c, h, w, device, img_size, = *x.shape, x.device, self.image_size
-        # assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
-        t = torch.randint(
-            0, self.num_timesteps, (x.shape[0],), device=self.device
-        ).long()
+        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         return self.p_losses(x, t, *args, **kwargs)
 
     def get_input(self, batch, k):
-        # fbank, log_magnitudes_stft, label_indices, fname, waveform, clip_label, text = batch
-        # fbank, stft, label_indices, fname, waveform, text = batch
         fname, text, label_indices, waveform, stft, fbank = (
             batch["fname"],
             batch["text"],
@@ -523,29 +434,13 @@ class DDPM(pl.LightningModule):
             batch["stft"],
             batch["log_mel_spec"],
         )
-        # for i in range(fbank.size(0)):
-        #     fb = fbank[i].numpy()
-        #     seg_lb = seg_label[i].numpy()
-        #     logits = np.mean(seg_lb, axis=0)
-        #     index = np.argsort(logits)[::-1][:5]
-        #     plt.imshow(seg_lb[:,index], aspect="auto")
-        #     plt.title(index)
-        #     plt.savefig("%s_label.png" % i)
-        #     plt.close()
-        #     plt.imshow(fb, aspect="auto")
-        #     plt.savefig("%s_fb.png" % i)
-        #     plt.close()
-        ret = {}
-
-        ret["fbank"] = (
-            fbank.unsqueeze(1).to(memory_format=torch.contiguous_format).float()
-        )
-        ret["stft"] = stft.to(memory_format=torch.contiguous_format).float()
-        # ret["clip_label"] = clip_label.to(memory_format=torch.contiguous_format).float()
-        ret["waveform"] = waveform.to(memory_format=torch.contiguous_format).float()
-        ret["text"] = list(text)
-        ret["fname"] = fname
-
+        ret = {
+            "fname": batch["fname"],
+            "text": list(batch["text"]),
+            "waveform": batch["waveform"].to(memory_format=torch.contiguous_format).float(),
+            "stft": batch["stft"].to(memory_format=torch.contiguous_format).float(),
+            "fbank": batch["log_mel_spec"].unsqueeze(1).to(memory_format=torch.contiguous_format).float(),
+        }
         for key in batch.keys():
             if key not in ret.keys():
                 ret[key] = batch[key]
@@ -560,170 +455,89 @@ class DDPM(pl.LightningModule):
     def warmup_step(self):
         if self.initial_learning_rate is None:
             self.initial_learning_rate = self.learning_rate
-
+        
+        current_lr = self.initial_learning_rate
         # Only the first parameter group
         if self.global_step <= self.warmup_steps:
             if self.global_step == 0:
-                print(
-                    "Warming up learning rate start with %s"
-                    % self.initial_learning_rate
-                )
-            self.trainer.optimizers[0].param_groups[0]["lr"] = (
-                self.global_step / self.warmup_steps
-            ) * self.initial_learning_rate
-        else:
-            # TODO set learning rate here
-            self.trainer.optimizers[0].param_groups[0][
-                "lr"
-            ] = self.initial_learning_rate
+                print(f"Warming up learning rate start with {self.initial_learning_rate}")
+            current_lr = (self.global_step / self.warmup_steps) * self.initial_learning_rate
+
+        # TODO Update learning rate here
+        self.trainer.optimizers[0].param_groups[0]["lr"] = current_lr
 
     def training_step(self, batch, batch_idx):
-        # You instantiate a optimizer for the scheduler
-        # But later you overwrite the optimizer by reloading its states from a checkpoint
-        # So you need to replace the optimizer with the checkpoint one
-        # if(self.lr_schedulers().optimizer.param_groups[0]['lr'] != self.trainer.optimizers[0].param_groups[0]['lr']):
-        #     self.lr_schedulers().optimizer = self.trainer.optimizers[0]
-
-        # if(self.ckpt is not None):
-        #     self.reload_everything()
-        #     self.ckpt = None
-
         self.random_clap_condition()
         self.warmup_step()
 
-        # if (
-        #     self.state is None
-        #     and len(self.trainer.optimizers[0].state_dict()["state"].keys()) > 0
-        # ):
-        #     self.state = (
-        #         self.trainer.optimizers[0].state_dict()["state"][0]["exp_avg"].clone()
-        #     )
-        # elif self.state is not None and batch_idx % 1000 == 0:
-        #     assert (
-        #         torch.sum(
-        #             torch.abs(
-        #                 self.state
-        #                 - self.trainer.optimizers[0].state_dict()["state"][0]["exp_avg"]
-        #             )
-        #         )
-        #         > 1e-7
-        #     ), "Optimizer is not working"
-
-        if len(self.metrics_buffer.keys()) > 0:
-            for k in self.metrics_buffer.keys():
-                self.log(
-                    k,
-                    self.metrics_buffer[k],
-                    prog_bar=False,
-                    logger=True,
-                    on_step=True,
-                    on_epoch=False,
-                )
-                # print(k, self.metrics_buffer[k])
+        # Log buffered metrics if exists
+        if len(self.metrics_buffer) > 0:
+            for key, value in self.metrics_buffer.items():
+                self.log(key, value, prog_bar=False, logger=True, on_step=True, on_epoch=False)
             self.metrics_buffer = {}
 
+        # Calculate loss
         loss, loss_dict = self.shared_step(batch)
 
-        self.log_dict(
-            {k: float(v) for k, v in loss_dict.items()},
-            prog_bar=True,
-            logger=True,
-            on_step=True,
-            on_epoch=True,
-        )
+        # Log loss dictionary
+        self.log_dict({k: float(v) for k, v in loss_dict.items()}, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        # Log global step and learning rate
+        self.log("global_step", float(self.global_step), prog_bar=True, logger=True, on_step=True, on_epoch=False)
 
-        self.log(
-            "global_step",
-            float(self.global_step),
-            prog_bar=True,
-            logger=True,
-            on_step=True,
-            on_epoch=False,
-        )
-
-        lr = self.trainer.optimizers[0].param_groups[0]["lr"]
-        self.log(
-            "lr_abs",
-            float(lr),
-            prog_bar=True,
-            logger=True,
-            on_step=True,
-            on_epoch=False,
-        )
+        current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
+        self.log("lr_abs", float(current_lr), prog_bar=True, logger=True, on_step=True, on_epoch=False,)
 
         return loss
 
     def random_clap_condition(self):
-        # This function is only used during training, let the CLAP model to use both text and audio as condition
-        assert self.training == True
+        assert self.training, "This function is only used during training, let the CLAP model to use both text and audio as condition"
 
-        for key in self.cond_stage_model_metadata.keys():
+        for key, metadata in self.cond_stage_model_metadata.items():
             metadata = self.cond_stage_model_metadata[key]
-            model_idx, cond_stage_key, conditioning_key = (
-                metadata["model_idx"],
-                metadata["cond_stage_key"],
-                metadata["conditioning_key"],
-            )
+            model_idx = metadata["model_idx"]
+            model = self.cond_stage_models[model_idx]
 
             # If we use CLAP as condition, we might use audio for training, but we also must use text for evaluation
-            if isinstance(
-                self.cond_stage_models[model_idx], CLAPAudioEmbeddingClassifierFreev2
-            ):
-                self.cond_stage_model_metadata[key][
-                    "cond_stage_key_orig"
-                ] = self.cond_stage_model_metadata[key]["cond_stage_key"]
-                self.cond_stage_model_metadata[key][
-                    "embed_mode_orig"
-                ] = self.cond_stage_models[model_idx].embed_mode
-                if torch.randn(1).item() < 0.5:
-                    self.cond_stage_model_metadata[key]["cond_stage_key"] = "text"
-                    self.cond_stage_models[model_idx].embed_mode = "text"
-                else:
-                    self.cond_stage_model_metadata[key]["cond_stage_key"] = "waveform"
-                    self.cond_stage_models[model_idx].embed_mode = "audio"
+            if not isinstance(model, CLAPAudioEmbeddingClassifierFreev2):
+                continue
+
+            # Store original settings
+            metadata["cond_stage_key_orig"] = metadata["cond_stage_key"]
+            metadata["embed_mode_orig"] = model.embed_mode
+            # Randomly choose between text and audio mode
+            if torch.randn(1).item() < 0.5:
+                metadata["cond_stage_key"] = "text"
+                model.embed_mode = "text"
+            else:
+                metadata["cond_stage_key"] = "waveform"
+                model.embed_mode = "audio"
 
     def on_validation_epoch_start(self) -> None:
         # Use text as condition during validation
-        for key in self.cond_stage_model_metadata.keys():
-            metadata = self.cond_stage_model_metadata[key]
-            model_idx, cond_stage_key, conditioning_key = (
-                metadata["model_idx"],
-                metadata["cond_stage_key"],
-                metadata["conditioning_key"],
-            )
+        for key, metadata in self.cond_stage_model_metadata.items():
+            model_idx = metadata["model_idx"]
+            model = self.cond_stage_models[model_idx]
 
-            # If we use CLAP as condition, we might use audio for training, but we also must use text for evaluation
-            if isinstance(
-                self.cond_stage_models[model_idx], CLAPAudioEmbeddingClassifierFreev2
-            ):
-                self.cond_stage_model_metadata[key][
-                    "cond_stage_key_orig"
-                ] = self.cond_stage_model_metadata[key]["cond_stage_key"]
-                self.cond_stage_model_metadata[key][
-                    "embed_mode_orig"
-                ] = self.cond_stage_models[model_idx].embed_mode
-                print(
-                    "Change the model original cond_keyand embed_mode %s, %s to text during evaluation"
-                    % (
-                        self.cond_stage_model_metadata[key]["cond_stage_key_orig"],
-                        self.cond_stage_model_metadata[key]["embed_mode_orig"],
-                    )
-                )
-                self.cond_stage_model_metadata[key]["cond_stage_key"] = "text"
-                self.cond_stage_models[model_idx].embed_mode = "text"
+            # CLAP 모델을 condition으로 사용 시 설정: evaluation시 text 모드로 전환 / training시 audio 모드
+            if isinstance(model, CLAPAudioEmbeddingClassifierFreev2):
+                # 원본 설정 저장
+                metadata["cond_stage_key_orig"] = metadata["cond_stage_key"]
+                metadata["embed_mode_orig"] = model.embed_mode
+                print(f"Change model condition from {metadata['cond_stage_key_orig']}, {metadata['embed_mode_orig']} to text during evaluation")
+                
+                # text 모드로 전환
+                metadata["cond_stage_key"] = "text"
+                model.embed_mode = "text"
 
-            if isinstance(
-                self.cond_stage_models[model_idx], CLAPGenAudioMAECond
-            ) or isinstance(self.cond_stage_models[model_idx], SequenceGenAudioMAECond):
-                self.cond_stage_model_metadata[key][
-                    "use_gt_mae_output_orig"
-                ] = self.cond_stage_models[model_idx].use_gt_mae_output
-                self.cond_stage_model_metadata[key][
-                    "use_gt_mae_prob_orig"
-                ] = self.cond_stage_models[model_idx].use_gt_mae_prob
+            # AudioMAE 모델 설정: predicted tokens로 전환
+            if isinstance(model, (CLAPGenAudioMAECond, SequenceGenAudioMAECond)):
+                # 원본 설정 저장
+                metadata["use_gt_mae_output_orig"] = model.use_gt_mae_output
+                metadata["use_gt_mae_prob_orig"] = model.use_gt_mae_prob
                 print("Change the model condition to the predicted AudioMAE tokens")
-                self.cond_stage_models[model_idx].use_gt_mae_output = False
-                self.cond_stage_models[model_idx].use_gt_mae_prob = 0.0
+
+                model.use_gt_mae_output = False
+                model.use_gt_mae_prob = 0.0
         self.validation_folder_name = self.get_validation_folder_name()
         return super().on_validation_epoch_start()
 
@@ -732,9 +546,7 @@ class DDPM(pl.LightningModule):
         self.generate_sample(
             [batch],
             name=self.validation_folder_name,
-            unconditional_guidance_scale=self.evaluation_params[
-                "unconditional_guidance_scale"
-            ],
+            unconditional_guidance_scale=self.evaluation_params["unconditional_guidance_scale"],
             ddim_steps=self.evaluation_params["ddim_sampling_steps"],
             n_gen=self.evaluation_params["n_candidates_per_samples"],
         )
@@ -742,92 +554,41 @@ class DDPM(pl.LightningModule):
     def get_validation_folder_name(self):
         now = datetime.datetime.now()
         timestamp = now.strftime("%m-%d-%H:%M")
-        return "val_%s_%s_cfg_scale_%s_ddim_%s_n_cand_%s" % (
-            self.global_step,
-            timestamp,
-            self.evaluation_params["unconditional_guidance_scale"],
-            self.evaluation_params["ddim_sampling_steps"],
-            self.evaluation_params["n_candidates_per_samples"],
-        )
+        return f"val_{self.global_step}_{timestamp}_cfg-scale_{self.evaluation_params['unconditional_guidance_scale']}_ddim_{self.evaluation_params['ddim_sampling_steps']}_n-cand_{self.evaluation_params['n_candidates_per_samples']}"
 
     def on_validation_epoch_end(self) -> None:
+        # 평가 수행
         if self.global_rank == 0 and self.evaluator is not None:
-            assert (
-                self.test_data_subset_path is not None
-            ), "Please set test_data_subset_path before validation so that model have a target folder"
+            assert self.test_data_subset_path is not None, "Please set test_data_subset_path before validation so that model have a target folder"
             try:
-
-                name = self.validation_folder_name
-                waveform_save_path = os.path.join(self.get_log_dir(), name)
-                if (
-                    os.path.exists(waveform_save_path)
-                    and len(os.listdir(waveform_save_path)) > 0
-                ):
-
-                    metrics = self.evaluator.main(
-                        waveform_save_path,
-                        self.test_data_subset_path,
-                    )
-
-                    self.metrics_buffer = {
-                        ("val/" + k): float(v) for k, v in metrics.items()
-                    }
+                waveform_save_path = os.path.join(self.get_log_dir(), self.validation_folder_name)
+                if os.path.exists(waveform_save_path) and len(os.listdir(waveform_save_path)) > 0:
+                    metrics = self.evaluator.main(waveform_save_path, self.test_data_subset_path)
+                    self.metrics_buffer = {f"val/{k}": float(v) for k, v in metrics.items()}
                 else:
-                    print(
-                        "The target folder for evaluation does not exist: %s"
-                        % waveform_save_path
-                    )
+                    print(f"The target folder for evaluation does not exist: {waveform_save_path}")
             except Exception as e:
-                print("Error encountered during evaluation: ", e)
+                print(f"Error encountered during evaluation: {e}")
 
-        # Very important or the program may fail
+        # CUDA 동기화 (Very important or the program may fail)
         torch.cuda.synchronize()
 
-        for key in self.cond_stage_model_metadata.keys():
-            metadata = self.cond_stage_model_metadata[key]
-            model_idx, cond_stage_key, conditioning_key = (
-                metadata["model_idx"],
-                metadata["cond_stage_key"],
-                metadata["conditioning_key"],
-            )
+        # 모델 설정 복원
+        for key, metadata in self.cond_stage_model_metadata.items():
+            model_idx = metadata["model_idx"]
+            model = self.cond_stage_models[model_idx]
 
-            if isinstance(
-                self.cond_stage_models[model_idx], CLAPAudioEmbeddingClassifierFreev2
-            ):
-                self.cond_stage_model_metadata[key][
-                    "cond_stage_key"
-                ] = self.cond_stage_model_metadata[key]["cond_stage_key_orig"]
-                self.cond_stage_models[
-                    model_idx
-                ].embed_mode = self.cond_stage_model_metadata[key]["embed_mode_orig"]
-                print(
-                    "Change back the embedding mode to %s %s"
-                    % (
-                        self.cond_stage_model_metadata[key]["cond_stage_key"],
-                        self.cond_stage_models[model_idx].embed_mode,
-                    )
-                )
+            # CLAP 모델 설정 복원
+            if isinstance(model, CLAPAudioEmbeddingClassifierFreev2):
+                metadata["cond_stage_key"] = metadata["cond_stage_key_orig"]
+                model.embed_mode = metadata["embed_mode_orig"]
+                print(f"Change back the embedding mode to {metadata['cond_stage_key']} {model.embed_mode}")
 
-            if isinstance(
-                self.cond_stage_models[model_idx], CLAPGenAudioMAECond
-            ) or isinstance(self.cond_stage_models[model_idx], SequenceGenAudioMAECond):
-                self.cond_stage_models[
-                    model_idx
-                ].use_gt_mae_output = self.cond_stage_model_metadata[key][
-                    "use_gt_mae_output_orig"
-                ]
-                self.cond_stage_models[
-                    model_idx
-                ].use_gt_mae_prob = self.cond_stage_model_metadata[key][
-                    "use_gt_mae_prob_orig"
-                ]
-                print(
-                    "Change the AudioMAE condition setting to %s (Use gt) %s (gt prob)"
-                    % (
-                        self.cond_stage_models[model_idx].use_gt_mae_output,
-                        self.cond_stage_models[model_idx].use_gt_mae_prob,
-                    )
-                )
+            # AudioMAE 모델 설정 복원
+            if isinstance(model, (CLAPGenAudioMAECond, SequenceGenAudioMAECond)):
+                model.use_gt_mae_output = metadata["use_gt_mae_output_orig"]
+                model.use_gt_mae_prob = metadata["use_gt_mae_prob_orig"]
+                print(f"Change the AudioMAE condition setting to {model.use_gt_mae_output} (Use gt) {model.use_gt_mae_prob} (gt prob)")
 
         return super().on_validation_epoch_end()
 
@@ -872,9 +633,7 @@ class DDPM(pl.LightningModule):
         if sample:
             # get denoise row
             with self.ema_scope("Plotting"):
-                samples, denoise_row = self.sample(
-                    batch_size=N, return_intermediates=True
-                )
+                samples, denoise_row = self.sample(batch_size=N, return_intermediates=True)
 
             log["samples"] = samples
             log["denoise_row"] = self._get_rows_from_list(denoise_row)
@@ -902,65 +661,50 @@ class DDPM(pl.LightningModule):
         requires_grad_num = 0
         total_num = 0
         require_grad_tensor = None
-        for p in module.parameters():
-            if p.requires_grad:
+        # 모듈의 trainable 파라미터 계산
+        for param in module.parameters():
+            if param.requires_grad:
                 requires_grad_num += 1
                 if require_grad_tensor is None:
-                    require_grad_tensor = p
+                    require_grad_tensor = param
             total_num += 1
-        print(
-            "Module: [%s] have %s trainable parameters out of %s total parameters (%.2f)"
-            % (name, requires_grad_num, total_num, requires_grad_num / total_num)
-        )
+        # 통계 출력
+        ratio = requires_grad_num / total_num
+        print(f"Module: [{name}] have {requires_grad_num} trainable parameters out of {total_num} total parameters ({ratio:.2f})")
         return require_grad_tensor
 
     def check_module_param_update(self):
+        # Initial parameter tracking
         if self.tracked_steps == 0:
             for name, module in self.named_children():
                 try:
-                    require_grad_tensor = self.statistic_require_grad_tensor_number(
-                        module, name=name
-                    )
+                    require_grad_tensor = self.statistic_require_grad_tensor_number(module, name=name)
                     if require_grad_tensor is not None:
                         self.param_dict[name] = require_grad_tensor.clone()
                     else:
-                        print("==> %s does not requires grad" % name)
+                        print(f"==> {name} does not requires grad")
                 except Exception as e:
-                    print("%s does not have trainable parameters: %s" % (name, e))
+                    print(f"{name} does not have trainable parameters: {e}")
                     continue
 
+        # Periodic parameter change check
         if self.tracked_steps % 5000 == 0:
             for name, module in self.named_children():
                 try:
-                    require_grad_tensor = self.statistic_require_grad_tensor_number(
-                        module, name=name
-                    )
-
+                    require_grad_tensor = self.statistic_require_grad_tensor_number(module, name=name)
                     if require_grad_tensor is not None:
-                        print(
-                            "===> Param diff %s: %s; Size: %s"
-                            % (
-                                name,
-                                torch.sum(
-                                    torch.abs(
-                                        self.param_dict[name] - require_grad_tensor
-                                    )
-                                ),
-                                require_grad_tensor.size(),
-                            )
-                        )
+                        param_diff = torch.sum(torch.abs(self.param_dict[name] - require_grad_tensor))
+                        print(f"===> Param diff {name}: {param_diff}; Size: {require_grad_tensor.size()}")
                     else:
-                        print("%s does not requires grad" % name)
+                        print(f"{name} does not requires grad")
                 except Exception as e:
-                    print("%s does not have trainable parameters: %s" % (name, e))
+                    print(f"{name} does not have trainable parameters: {e}")
                     continue
 
         self.tracked_steps += 1
 
 
 class LatentDiffusion(DDPM):
-    """main class"""
-
     def __init__(
         self,
         first_stage_config,
@@ -968,121 +712,82 @@ class LatentDiffusion(DDPM):
         num_timesteps_cond=None,
         cond_stage_key="image",
         optimize_ddpm_parameter=True,
-        unconditional_prob_cfg=0.1,
         warmup_steps=10000,
-        cond_stage_trainable=False,
         concat_mode=True,
         cond_stage_forward=None,
         conditioning_key=None,
         scale_factor=1.0,
-        batchsize=None,
-        evaluation_params={},
-        scale_by_std=False,
         base_learning_rate=None,
+        scale_by_std=False,
+        evaluation_params={},
         *args,
         **kwargs,
-    ):
+    ):  # unconditional_prob_cfg=0.1,
+
         self.learning_rate = base_learning_rate
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
         self.warmup_steps = warmup_steps
-
-        if optimize_ddpm_parameter:
-            if unconditional_prob_cfg == 0.0:
-                "You choose to optimize DDPM. The classifier free guidance scale should be 0.1"
-                unconditional_prob_cfg = 0.1
-        else:
-            if unconditional_prob_cfg == 0.1:
-                "You choose not to optimize DDPM. The classifier free guidance scale should be 0.0"
-                unconditional_prob_cfg = 0.0
-
         self.evaluation_params = evaluation_params
+
+        # DDPM 최적화 관련 설정 (optimize DDPM: CFG_scale=0.1 / not to optimize DDPM: CFG_scale=0.0)
+        self.unconditional_prob_cfg = 0.1 if optimize_ddpm_parameter else 0.0
+
         assert self.num_timesteps_cond <= kwargs["timesteps"]
 
-        # for backwards compatibility after implementation of DiffusionWrapper
-        # if conditioning_key is None:
-        #     conditioning_key = "concat" if concat_mode else "crossattn"
-        # if cond_stage_config == "__is_unconditional__":
-        #     conditioning_key = None
+        self.conditioning_key = list(cond_stage_config.keys())  # 조건부 설정
 
-        conditioning_key = list(cond_stage_config.keys())
-
-        self.conditioning_key = conditioning_key
-
-        ckpt_path = kwargs.pop("ckpt_path", None)
+        ckpt_path = kwargs.pop("ckpt_path", None)  # 부모 클래스 초기화
         ignore_keys = kwargs.pop("ignore_keys", [])
         super().__init__(conditioning_key=conditioning_key, *args, **kwargs)
 
-        self.optimize_ddpm_parameter = optimize_ddpm_parameter
-        # if(not optimize_ddpm_parameter):
-        #     print("Warning: Close the optimization of the latent diffusion model")
-        #     for p in self.model.parameters():
-        #         p.requires_grad=False
-
+        self.optimize_ddpm_parameter = optimize_ddpm_parameter  # 모델 구성 설정
         self.concat_mode = concat_mode
-        self.cond_stage_key = cond_stage_key
-        self.cond_stage_key_orig = cond_stage_key
-        try:
-            self.num_downs = len(first_stage_config.params.ddconfig.ch_mult) - 1
-        except:
-            self.num_downs = 0
-        if not scale_by_std:
+        self.cond_stage_key = self.cond_stage_key_orig = cond_stage_key
+        
+        if not scale_by_std:  # scale factor 설정
             self.scale_factor = scale_factor
         else:
             self.register_buffer("scale_factor", torch.tensor(scale_factor))
+
+        try:  # 모델 구성요소 초기화
+            self.num_downs = len(first_stage_config.params.ddconfig.ch_mult) - 1
+        except:
+            self.num_downs = 0
         self.instantiate_first_stage(first_stage_config)
-        self.unconditional_prob_cfg = unconditional_prob_cfg
         self.cond_stage_models = nn.ModuleList([])
         self.instantiate_cond_stage(cond_stage_config)
-        self.cond_stage_forward = cond_stage_forward
+
+        self.cond_stage_forward = cond_stage_forward  # 추가 설정
         self.clip_denoised = False
         self.bbox_tokenizer = None
         self.conditional_dry_run_finished = False
-        self.restarted_from_ckpt = False
+
+        self.restarted_from_ckpt = False  # 체크포인트 로딩
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys)
             self.restarted_from_ckpt = True
 
     def configure_optimizers(self):
-        lr = self.learning_rate
         params = list(self.model.parameters())
+        # Combine parameters from conditional stage models
+        for cond_model in self.cond_stage_models:
+            params.extend(list(cond_model.parameters()))
 
-        for each in self.cond_stage_models:
-            params = params + list(
-                each.parameters()
-            )  # Add the parameter from the conditional stage
-
+        # Add logvar parameters if needed
         if self.learn_logvar:
             print("Diffusion model optimizing logvar")
             params.append(self.logvar)
-        opt = torch.optim.AdamW(params, lr=lr)
-        # if self.use_scheduler:
-        #     assert "target" in self.scheduler_config
-        #     scheduler = instantiate_from_config(self.scheduler_config)
+        return torch.optim.AdamW(params, lr=self.learning_rate)
 
-        #     print("Setting up LambdaLR scheduler...")
-        #     scheduler = [
-        #         {
-        #             "scheduler": LambdaLR(opt, lr_lambda=scheduler.schedule),
-        #             "interval": "step",
-        #             "frequency": 1,
-        #         }
-        #     ]
-        #     return [opt], scheduler
-        return opt
-
-    def make_cond_schedule(
-        self,
-    ):
-        self.cond_ids = torch.full(
-            size=(self.num_timesteps,),
-            fill_value=self.num_timesteps - 1,
-            dtype=torch.long,
-        )
-        ids = torch.round(
-            torch.linspace(0, self.num_timesteps - 1, self.num_timesteps_cond)
-        ).long()
-        self.cond_ids[: self.num_timesteps_cond] = ids
+    def make_cond_schedule(self):
+        """timesteps에 대한 conditioning schedule 생성"""
+        # Initialize all timesteps with the last timestep value
+        self.cond_ids = torch.full(size=(self.num_timesteps,), fill_value=self.num_timesteps - 1, dtype=torch.long)
+        
+        # Create linearly spaced values for conditional timesteps
+        cond_steps = torch.linspace(0, self.num_timesteps - 1, self.num_timesteps_cond)
+        self.cond_ids[:self.num_timesteps_cond] = torch.round(cond_steps).long()
 
     @rank_zero_only
     @torch.no_grad()
@@ -1118,9 +823,7 @@ class LatentDiffusion(DDPM):
         linear_end=2e-2,
         cosine_s=8e-3,
     ):
-        super().register_schedule(
-            given_betas, beta_schedule, timesteps, linear_start, linear_end, cosine_s
-        )
+        super().register_schedule(given_betas, beta_schedule, timesteps, linear_start, linear_end, cosine_s)
 
         self.shorten_cond_schedule = self.num_timesteps_cond > 1
         if self.shorten_cond_schedule:
@@ -1141,13 +844,14 @@ class LatentDiffusion(DDPM):
 
     def instantiate_cond_stage(self, config):
         self.cond_stage_model_metadata = {}
-        for i, cond_model_key in enumerate(config.keys()):
-            model = instantiate_from_config(config[cond_model_key])
+        for model_idx, (model_key, model_config) in enumerate(config.items()):
+            model = instantiate_from_config(model_config)
             self.cond_stage_models.append(model)
-            self.cond_stage_model_metadata[cond_model_key] = {
-                "model_idx": i,
-                "cond_stage_key": config[cond_model_key]["cond_stage_key"],
-                "conditioning_key": config[cond_model_key]["conditioning_key"],
+
+            self.cond_stage_model_metadata[model_key] = {
+                "model_idx": model_idx,
+                "cond_stage_key": model_config["cond_stage_key"],
+                "conditioning_key": model_config["conditioning_key"]
             }
 
     def get_first_stage_encoding(self, encoder_posterior):
@@ -1156,36 +860,41 @@ class LatentDiffusion(DDPM):
         elif isinstance(encoder_posterior, torch.Tensor):
             z = encoder_posterior
         else:
-            raise NotImplementedError(
-                f"encoder_posterior of type '{type(encoder_posterior)}' not yet implemented"
-            )
+            raise NotImplementedError(f"Unsupported encoder_posterior type: {type(encoder_posterior)}")
         return self.scale_factor * z
 
     def get_learned_conditioning(self, c, key, unconditional_cfg):
-        assert key in self.cond_stage_model_metadata.keys()
-
-        # Classifier-free guidance
+        """
+        Gets learned conditioning for the model
+        Args:
+            c: Input conditioning
+            key: Conditioning key
+            unconditional_cfg: Whether to use unconditional configuration
+        Returns:
+            Processed conditioning
+        """
+        if key not in self.cond_stage_model_metadata:
+            raise KeyError(f"Invalid conditioning key: {key}")
+        
+        # Get model for the given key
+        model = self.cond_stage_models[self.cond_stage_model_metadata[key]["model_idx"]]
+        
         if not unconditional_cfg:
-            c = self.cond_stage_models[
-                self.cond_stage_model_metadata[key]["model_idx"]
-            ](c)
+            return model(c)
+            
+        # Handle unconditional configuration
+        if isinstance(c, dict):
+            c = c[next(iter(c))]  # Get first element
+            
+        # Get batch size
+        if isinstance(c, torch.Tensor):
+            batch_size = c.size(0)
+        elif isinstance(c, list):
+            batch_size = len(c)
         else:
-            # when the cond_stage_key is "all", pick one random element out
-            if isinstance(c, dict):
-                c = c[list(c.keys())[0]]
-
-            if isinstance(c, torch.Tensor):
-                batchsize = c.size(0)
-            elif isinstance(c, list):
-                batchsize = len(c)
-            else:
-                raise NotImplementedError()
-
-            c = self.cond_stage_models[
-                self.cond_stage_model_metadata[key]["model_idx"]
-            ].get_unconditional_condition(batchsize)
-
-        return c
+            raise NotImplementedError(f"Unsupported conditioning type: {type(c)}")
+            
+        return model.get_unconditional_condition(batch_size)
 
     def get_input(
         self,
@@ -1197,90 +906,66 @@ class LatentDiffusion(DDPM):
         return_encoder_output=False,
         unconditional_prob_cfg=0.1,
     ):
-        x = super().get_input(batch, k)
-
-        x = x.to(self.device)
-
+        x = super().get_input(batch, k).to(self.device)
+        
+        # Generate first stage encoding if required
+        z = None
+        encoder_posterior = None
         if return_first_stage_encode:
             encoder_posterior = self.encode_first_stage(x)
-            # print("After encode_first_stage:", encoder_posterior.requires_grad)
-            # z = self.get_first_stage_encoding(encoder_posterior).detach()               ############### 여기에요 여기.
+            # z = self.get_first_stage_encoding(encoder_posterior).detach()               ##### 여기 detach 지움.
             z = self.get_first_stage_encoding(encoder_posterior)
-            # print("After get_first_stage_encoding:", z.requires_grad)
-        else:
-            z = None
+
         cond_dict = {}
         if len(self.cond_stage_model_metadata.keys()) > 0:
-            unconditional_cfg = False
-            if self.conditional_dry_run_finished and self.make_decision(
-                unconditional_prob_cfg
-            ):
-                unconditional_cfg = True
-            for cond_model_key in self.cond_stage_model_metadata.keys():
-                cond_stage_key = self.cond_stage_model_metadata[cond_model_key][
-                    "cond_stage_key"
-                ]
-
-                if cond_model_key in cond_dict.keys():
+            unconditional_cfg = self.conditional_dry_run_finished and self.make_decision(unconditional_prob_cfg)  # True/False
+            
+            # Process each conditional model
+            for cond_model_key, metadata in self.cond_stage_model_metadata.items():
+                if cond_model_key in cond_dict:
                     continue
 
+                # Get conditional input (conditioning에 사용될 original data, cond_model_key: "all"이면 cond_model이 batch의 모든 정보를 필요로 함)
+                cond_stage_key = metadata["cond_stage_key"]
+                xc = batch if cond_stage_key == "all" else super().get_input(batch, cond_stage_key)
+
+                if isinstance(xc, torch.Tensor):
+                    xc = xc.to(self.device)
+
+                # Warning for CLAP model in evaluation
                 if not self.training:
-                    if isinstance(
-                        self.cond_stage_models[
-                            self.cond_stage_model_metadata[cond_model_key]["model_idx"]
-                        ],
-                        CLAPAudioEmbeddingClassifierFreev2,
-                    ):
-                        print(
-                            "Warning: CLAP model normally should use text for evaluation"
-                        )
+                    model = self.cond_stage_models[metadata["model_idx"]]
+                    if isinstance(model, CLAPAudioEmbeddingClassifierFreev2):
+                        print("Warning: CLAP model normally should use text for evaluation")
 
-                # The original data for conditioning
-                # If cond_model_key is "all", that means the conditional model need all the information from a batch
+                # Get learned conditioning (cond_stage_key:"all"이면 xc는 모든 keys를 담은 dict임/아니면 xc는 dict 한 항목이 됨)
+                c = self.get_learned_conditioning(xc, key=cond_model_key, unconditional_cfg=unconditional_cfg)
 
-                if cond_stage_key != "all":
-                    xc = super().get_input(batch, cond_stage_key)
-                    if type(xc) == torch.Tensor:
-                        xc = xc.to(self.device)
-                else:
-                    xc = batch
-
-                # if cond_stage_key is "all", xc will be a dictionary containing all keys
-                # Otherwise xc will be an entry of the dictionary
-                c = self.get_learned_conditioning(
-                    xc, key=cond_model_key, unconditional_cfg=unconditional_cfg
-                )
-
-                # cond_dict will be used to condition the diffusion model
-                # If one conditional model return multiple conditioning signal
+                # Update conditioning dictionary (cond_dict는 diffusion의 condition로 사용됨. 한 cond_model이 여러 cond_signal 반환하는 경우를 처리)
                 if isinstance(c, dict):
-                    for k in c.keys():
-                        cond_dict[k] = c[k]
+                    cond_dict.update(c)  # c dict가 가진 key와 그 value로 갱신
                 else:
                     cond_dict[cond_model_key] = c
 
-        # If the key is accidently added to the dictionary and not in the condition list, remove the condition
-        # for k in list(cond_dict.keys()):
-        #     if(k not in self.cond_stage_model_metadata.keys()):
-        #         del cond_dict[k]
+        # Prepare output list
+        outputs = [z, cond_dict]
 
-        out = [z, cond_dict]
-
+        # Add optional outputs
         if return_decoding_output:
-            xrec = self.decode_first_stage(z)
-            out += [xrec]
+            outputs.append(self.decode_first_stage(z))
 
         if return_encoder_input:
-            out += [x]
+            outputs.append(x)
 
         if return_encoder_output:
-            out += [encoder_posterior]
+            outputs.append(encoder_posterior)
 
+        # Update conditional dry run status
         if not self.conditional_dry_run_finished:
             self.conditional_dry_run_finished = True
 
         # Output is a dictionary, where the value could only be tensor or tuple
-        return out
+        return outputs
 
     def decode_first_stage(self, z):
         with torch.no_grad():
@@ -1288,9 +973,7 @@ class LatentDiffusion(DDPM):
             decoding = self.first_stage_model.decode(z)
         return decoding
 
-    def mel_spectrogram_to_waveform(
-        self, mel, savepath=".", bs=None, name="outwav", save=True
-    ):
+    def mel_spectrogram_to_waveform(self, mel, savepath=".", bs=None, name="outwav", save=True):
         # Mel: [bs, 1, t-steps, fbins]
         if len(mel.size()) == 4:
             mel = mel.squeeze(1)
@@ -1303,12 +986,11 @@ class LatentDiffusion(DDPM):
 
     def encode_first_stage(self, x):
         # with torch.no_grad():
-        #     return self.first_stage_model.encode(x)                  #################### 여기도 수정했드아.
+        #     return self.first_stage_model.encode(x)                  ##### 여기도 수정함.
         return self.first_stage_model.encode(x)
 
     def extract_possible_loss_in_cond_dict(self, cond_dict):
         # This function enable the conditional module to return loss function that can optimize them
-
         assert isinstance(cond_dict, dict)
         losses = {}
 
@@ -1327,10 +1009,7 @@ class LatentDiffusion(DDPM):
 
         # All the conditional key in the metadata should be used
         for key in self.cond_stage_model_metadata.keys():
-            assert key in new_cond_dict.keys(), "%s, %s" % (
-                key,
-                str(new_cond_dict.keys()),
-            )
+            assert key in new_cond_dict.keys(), f"Key '{key}' not found in available keys: {list(new_cond_dict)}"
 
         return new_cond_dict
 
@@ -1342,9 +1021,7 @@ class LatentDiffusion(DDPM):
         else:
             unconditional_prob_cfg = 0.0  # TODO possible bug here
 
-        x, c = self.get_input(
-            batch, self.first_stage_key, unconditional_prob_cfg=unconditional_prob_cfg
-        )
+        x, c = self.get_input(batch, self.first_stage_key, unconditional_prob_cfg=unconditional_prob_cfg)
 
         if self.optimize_ddpm_parameter:
             loss, loss_dict = self(x, self.filter_useful_cond_dict(c))
@@ -1364,27 +1041,13 @@ class LatentDiffusion(DDPM):
                 else:
                     loss = loss + additional_loss_for_cond_modules[k]
 
-        # for k,v in additional_loss_for_cond_modules.items():
-        #     self.log(
-        #         "cond_stage/"+k,
-        #         float(v),
-        #         prog_bar=True,
-        #         logger=True,
-        #         on_step=True,
-        #         on_epoch=True,
-        #     )
         if self.training:
             assert loss is not None
 
         return loss, loss_dict
 
     def forward(self, x, c, *args, **kwargs):
-        t = torch.randint(
-            0, self.num_timesteps, (x.shape[0],), device=self.device
-        ).long()
-
-        # assert c is not None
-        # c = self.get_learned_conditioning(c)
+        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
 
         loss, loss_dict = self.p_losses(x, c, t, *args, **kwargs)
         return loss, loss_dict
@@ -1398,7 +1061,6 @@ class LatentDiffusion(DDPM):
 
     def apply_model(self, x_noisy, t, cond, return_ids=False):
         cond = self.reorder_cond_dict(cond)
-
         x_recon = self.model(x_noisy, t, cond_dict=cond)
 
         if isinstance(x_recon, tuple) and not return_ids:
@@ -1460,9 +1122,7 @@ class LatentDiffusion(DDPM):
 
         if score_corrector is not None:
             assert self.parameterization == "eps"
-            model_out = score_corrector.modify_score(
-                self, model_out, x, t, c, **corrector_kwargs
-            )
+            model_out = score_corrector.modify_score(self, model_out, x, t, c, **corrector_kwargs)
 
         if return_codebook_ids:
             model_out, logits = model_out
@@ -1478,9 +1138,7 @@ class LatentDiffusion(DDPM):
             x_recon.clamp_(-1.0, 1.0)
         if quantize_denoised:
             x_recon, _, [_, _, indices] = self.first_stage_model.quantize(x_recon)
-        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
-            x_start=x_recon, x_t=x, t=t
-        )
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
         if return_codebook_ids:
             return model_mean, posterior_variance, posterior_log_variance, logits
         elif return_x0:
@@ -1528,19 +1186,10 @@ class LatentDiffusion(DDPM):
         if noise_dropout > 0.0:
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
         # no noise when t == 0
-        nonzero_mask = (
-            (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1))).contiguous()
-        )
+        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1))).contiguous()
 
-        # if return_codebook_ids:
-        #     return model_mean + nonzero_mask * (
-        #         0.5 * model_log_variance
-        #     ).exp() * noise, logits.argmax(dim=1)
         if return_x0:
-            return (
-                model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise,
-                x0,
-            )
+            return (model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise, x0)
         else:
             return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
